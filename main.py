@@ -27,6 +27,7 @@ DEFAULT_PUSH_EVENTS = {"task-complete", "review-required"}
 DEFAULT_REPLY_WINDOW_SECONDS = 600
 QUICK_APPROVE_LETTERS = {"y", "a"}
 QUICK_SWITCH_LETTERS = {"s"}
+QUICK_STOP_WORDS = {"stop", "cancel", "interrupt", "停止", "取消", "中断", "掐断", "掐断对话", "停止对话"}
 CONVERSATION_SELECT_WINDOW_SECONDS = 60
 
 
@@ -38,6 +39,8 @@ class ReplySession:
     conversation_label: str
     reason: str
     source: str
+    flag: str
+    slot: int
 
 
 @dataclass
@@ -77,6 +80,8 @@ class CodexBridgePlugin(Star):
         self._reply_window_seconds = int(self._get_config_value("reply_window_seconds", DEFAULT_REPLY_WINDOW_SECONDS) or DEFAULT_REPLY_WINDOW_SECONDS)
         self._reply_sessions: dict[str, ReplySession] = {}
         self._conversation_select_sessions: dict[str, ConversationSelectSession] = {}
+        self._reply_sessions_by_flag: dict[str, ReplySession] = {}
+        self._reply_sessions_by_slot: dict[tuple[str, int], ReplySession] = {}
 
     async def initialize(self):
         logger.info(f"{LOG_PREFIX} plugin initialized")
@@ -258,15 +263,30 @@ class CodexBridgePlugin(Star):
             return True
         return umo in self._allowed_umos
 
+    def _make_reply_flag(self, conversation_id: str, reason: str) -> str:
+        digest = hashlib.sha256(f"{conversation_id}|{reason}|{self._now_text()}".encode("utf-8")).hexdigest()
+        return digest[:6].upper()
+
     def _arm_reply_session(self, umo: str, conversation_id: str, conversation_label: str, reason: str, source: str = ""):
-        self._reply_sessions[umo] = ReplySession(
+        used_slots = {
+            session.slot
+            for key, session in self._reply_sessions_by_slot.items()
+            if key[0] == umo and asyncio.get_running_loop().time() - session.created_at <= self._reply_window_seconds
+        }
+        slot = next((index for index in range(1, 10) if index not in used_slots), 1)
+        session = ReplySession(
             target_umo=umo,
             created_at=asyncio.get_running_loop().time(),
             conversation_id=conversation_id,
             conversation_label=conversation_label,
             reason=reason,
             source=source,
+            flag=self._make_reply_flag(conversation_id, reason),
+            slot=slot,
         )
+        self._reply_sessions[umo] = session
+        self._reply_sessions_by_flag[session.flag] = session
+        self._reply_sessions_by_slot[(umo, session.slot)] = session
 
     def _get_reply_session(self, umo: str) -> ReplySession | None:
         session = self._reply_sessions.get(umo)
@@ -274,12 +294,63 @@ class CodexBridgePlugin(Star):
             return None
         now = asyncio.get_running_loop().time()
         if now - session.created_at > self._reply_window_seconds:
-            self._reply_sessions.pop(umo, None)
+            self._clear_reply_session(umo)
             return None
         return session
 
     def _clear_reply_session(self, umo: str):
+        session = self._reply_sessions.pop(umo, None)
+        if session is not None:
+            self._clear_reply_session_object(session)
+
+    def _clear_reply_session_object(self, session: ReplySession):
+        self._reply_sessions_by_flag.pop(session.flag, None)
+        self._reply_sessions_by_slot.pop((session.target_umo, session.slot), None)
+        if self._reply_sessions.get(session.target_umo) is session:
+            self._reply_sessions.pop(session.target_umo, None)
+
+    def _clear_all_reply_sessions(self, umo: str):
+        for key, session in list(self._reply_sessions_by_slot.items()):
+            if key[0] == umo:
+                self._reply_sessions_by_slot.pop(key, None)
+                self._reply_sessions_by_flag.pop(session.flag, None)
         self._reply_sessions.pop(umo, None)
+
+    def _get_reply_session_by_flag(self, flag: str) -> ReplySession | None:
+        session = self._reply_sessions_by_flag.get(flag.upper())
+        if not session:
+            return None
+        now = asyncio.get_running_loop().time()
+        if now - session.created_at > self._reply_window_seconds:
+            self._clear_reply_session_object(session)
+            return None
+        return session
+
+    def _get_reply_session_by_slot(self, umo: str, slot: int) -> ReplySession | None:
+        session = self._reply_sessions_by_slot.get((umo, slot))
+        if not session:
+            return None
+        now = asyncio.get_running_loop().time()
+        if now - session.created_at > self._reply_window_seconds:
+            self._clear_reply_session_object(session)
+            return None
+        return session
+
+    def _get_active_reply_sessions(self, umo: str) -> list[ReplySession]:
+        sessions: list[ReplySession] = []
+        seen: set[str] = set()
+        for key, session in list(self._reply_sessions_by_slot.items()):
+            if key[0] != umo:
+                continue
+            active = self._get_reply_session_by_slot(umo, key[1])
+            if active is None:
+                continue
+            session_key = f"{active.flag}:{active.slot}"
+            if session_key in seen:
+                continue
+            seen.add(session_key)
+            sessions.append(active)
+        return sessions
 
     def _arm_conversation_select_session(self, umo: str):
         self._conversation_select_sessions[umo] = ConversationSelectSession(
@@ -362,6 +433,9 @@ class CodexBridgePlugin(Star):
     def _is_quick_switch_text(self, text: str) -> bool:
         return len(text.strip()) == 1 and text.strip().lower() in QUICK_SWITCH_LETTERS
 
+    def _is_quick_stop_text(self, text: str) -> bool:
+        return text.strip().lower() in QUICK_STOP_WORDS
+
     def _current_state(self) -> dict[str, Any]:
         return self._client_info.get("state") or self._last_client_info.get("state") or {}
 
@@ -390,9 +464,6 @@ class CodexBridgePlugin(Star):
         detail = event_payload.get("detail") or {}
         is_current = self._event_is_current_conversation(event_payload)
         reply_source = "sidebar" if str(detail.get("source") or "") == "sidebar" and not is_current else ""
-        text = self._render_push_message(event_name, event_payload, detail)
-        if not text:
-            return
 
         for target in self._push_targets:
             try:
@@ -403,6 +474,10 @@ class CodexBridgePlugin(Star):
                     event_name,
                     reply_source,
                 )
+                session = self._reply_sessions.get(target)
+                text = self._render_push_message(event_name, event_payload, detail, session)
+                if not text:
+                    continue
                 await self.context.send_message(target, event_payload.get("_message_chain") or self._plain_chain(text))
             except Exception as exc:
                 logger.warning(f"{LOG_PREFIX} failed to push event to {target}: {exc}")
@@ -412,32 +487,47 @@ class CodexBridgePlugin(Star):
 
         return MessageChain().message(text)
 
-    def _render_push_message(self, event_name: str, event_payload: dict[str, Any], detail: dict[str, Any]) -> str:
+    def _render_push_message(
+        self,
+        event_name: str,
+        event_payload: dict[str, Any],
+        detail: dict[str, Any],
+        session: ReplySession | None = None,
+    ) -> str:
         conversation_id = self._conversation_label(event_payload)
         text = str(detail.get("text") or "").strip()
         preview = self._clean_preview_text(text)[:500] if text else ""
         reply_hint = f"{self._reply_window_seconds} 秒内快速回复（仅一次有效）"
         is_sidebar_event = str(detail.get("source") or "") == "sidebar" and not self._event_is_current_conversation(event_payload)
         switch_hint = f"{self._reply_window_seconds} 秒内快速操作：发送 s 切换到该会话"
+        flag_hint = ""
+        if session:
+            flag_hint = f"回复编号：{session.slot}"
 
         if event_name == "task-complete":
-            quick_hint = f"{switch_hint}；切换后可继续回复。" if is_sidebar_event else f"{reply_hint}：直接发送消息即可继续对话。"
+            quick_hint = (
+                f"{switch_hint}；切换后使用 {session.slot if session else 1} 回复，或发送 {session.slot if session else 1} 掐断对话。"
+                if is_sidebar_event
+                else f"{reply_hint}：发送 {session.slot if session else 1} <内容> 可继续该对话；只有一个待回复会话时可省略编号；发送 {session.slot if session else 1} 掐断对话 可停止。"
+            )
             return (
                 f"[Codex] 任务已完成\n"
                 f"会话：{conversation_id}\n\n"
                 f"{preview}\n\n"
+                f"{flag_hint}\n"
                 f"{quick_hint}"
             )
         if event_name == "review-required":
             quick_hint = (
-                f"{switch_hint}；切换后发送 y 同意审核。"
+                f"{switch_hint}；切换后发送 {session.slot if session else 1} y 同意审核，或发送 {session.slot if session else 1} 掐断对话。"
                 if is_sidebar_event
-                else f"{reply_hint}：发送 y 同意审核；发送其他内容则作为回复转发给 Codex。"
+                else f"{reply_hint}：发送 {session.slot if session else 1} y 同意审核；发送 {session.slot if session else 1} <内容> 作为该对话回复；只有一个待回复会话时可省略编号；发送 {session.slot if session else 1} 掐断对话 可停止。"
             )
             return (
                 f"[Codex] 需要审核\n"
                 f"会话：{conversation_id}\n\n"
                 f"{preview}\n\n"
+                f"{flag_hint}\n"
                 f"{quick_hint}"
             )
         if event_name == "review-approved":
@@ -507,7 +597,7 @@ class CodexBridgePlugin(Star):
             return
 
         if len(parts) == 1:
-            yield event.plain_result("可用子命令：状态、发送 <内容>、草稿 <内容>、回复 <内容>、同意、会话、切换 <编号/名称>、停止回复")
+            yield event.plain_result("可用子命令：状态、发送 <内容>、草稿 <内容>、回复 <内容>、同意、会话、切换 <编号/名称>、掐断对话、停止回复")
             return
 
         action = parts[1].strip().lower()
@@ -600,12 +690,23 @@ class CodexBridgePlugin(Star):
             yield event.plain_result(f"已请求切换会话：{payload}")
             return
 
-        if action in {"stop-reply", "停止回复"}:
-            self._clear_reply_session(source_umo)
-            yield event.plain_result("已关闭当前会话的快速回复模式。")
+        if action in QUICK_STOP_WORDS:
+            command_payload = {"target": payload} if payload else {}
+            ok = await self._send_command("stop", command_payload)
+            if not ok:
+                yield event.plain_result("Codex 未连接，无法掐断对话。")
+                return
+            self._clear_all_reply_sessions(source_umo)
+            self._clear_conversation_select_session(source_umo)
+            yield event.plain_result("已请求点击 Codex 停止按钮。")
             return
 
-        yield event.plain_result("未知子命令。可用：状态、发送 <内容>、草稿 <内容>、回复 <内容>、同意、会话、切换 <编号/名称>、停止回复")
+        if action in {"stop-reply", "停止回复"}:
+            self._clear_all_reply_sessions(source_umo)
+            yield event.plain_result("已关闭当前 QQ 会话的所有快速回复模式。")
+            return
+
+        yield event.plain_result("未知子命令。可用：状态、发送 <内容>、草稿 <内容>、回复 <内容>、同意、会话、切换 <编号/名称>、掐断对话、停止回复")
 
     @filter.event_message_type(filter.EventMessageType.ALL)
     async def codex_followup_message(self, event: AstrMessageEvent):
@@ -621,6 +722,25 @@ class CodexBridgePlugin(Star):
         if text.startswith("/") or text.startswith("%"):
             return
 
+        token_session = None
+        token_text = text
+        explicit_reply_target = False
+        slot_match = re.match(r"^(\d{1,2})\s+(.+)$", text)
+        if slot_match:
+            explicit_reply_target = True
+            token_session = self._get_reply_session_by_slot(source_umo, int(slot_match.group(1)))
+            token_text = (slot_match.group(2) or "").strip()
+            if token_session is not None:
+                text = token_text
+        else:
+            flag_match = re.match(r"^#([A-Za-z0-9]{4,12})\s*(.*)$", text)
+            if flag_match:
+                explicit_reply_target = True
+                token_session = self._get_reply_session_by_flag(flag_match.group(1))
+                token_text = (flag_match.group(2) or "").strip()
+                if token_session is not None:
+                    text = token_text
+
         select_session = self._get_conversation_select_session(source_umo)
         if select_session and text.isdigit():
             self._mark_message_consumed(event, text)
@@ -632,7 +752,15 @@ class CodexBridgePlugin(Star):
             yield event.plain_result(f"已请求切换到第 {text} 个会话。")
             return
 
-        session = self._get_reply_session(source_umo)
+        if token_session is not None:
+            session = token_session
+        elif explicit_reply_target:
+            return
+        else:
+            active_sessions = self._get_active_reply_sessions(source_umo)
+            if len(active_sessions) != 1:
+                return
+            session = active_sessions[0]
         if not session:
             return
 
@@ -648,25 +776,40 @@ class CodexBridgePlugin(Star):
             yield event.plain_result(f"已请求切换到会话：{label}")
             return
 
+        if self._is_quick_stop_text(text):
+            self._mark_message_consumed(event, text)
+            ok = await self._send_command("stop", {"target": session.conversation_id or session.conversation_label})
+            if not ok:
+                yield event.plain_result("Codex 未连接，无法掐断对话。")
+                return
+            self._clear_reply_session_object(session)
+            self._clear_conversation_select_session(source_umo)
+            yield event.plain_result("已请求点击该会话的 Codex 停止按钮。")
+            return
+
         if session.reason == "review-required" and self._is_quick_approve_text(text):
             self._mark_message_consumed(event, text)
-            if session.source == "sidebar":
-                yield event.plain_result("该审核不在当前 Codex 对话中，请先发送 s 切换到该会话，再发送 y 同意审核。")
-                return
-            ok = await self._send_command("approve", {})
+            ok = await self._send_command("approve", {"target": session.conversation_id or session.conversation_label})
             if not ok:
                 yield event.plain_result("Codex 未连接，无法发送审核同意。")
                 return
-            self._clear_reply_session(source_umo)
+            self._clear_reply_session_object(session)
             yield event.plain_result("已发送审核同意。")
             return
         if not self._remember_signature(self._recent_reply_signatures, self._reply_signature(source_umo, text), 120):
             return
 
         self._mark_message_consumed(event, text)
-        ok = await self._send_command("send", {"text": text, "submit": True})
+        ok = await self._send_command(
+            "send",
+            {
+                "text": text,
+                "submit": True,
+                "target": session.conversation_id or session.conversation_label,
+            },
+        )
         if not ok:
             yield event.plain_result("Codex 未连接。")
             return
-        self._clear_reply_session(source_umo)
+        self._clear_reply_session_object(session)
         yield event.plain_result("已转发你的快速回复给 Codex。")
