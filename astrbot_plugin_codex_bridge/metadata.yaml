@@ -1,0 +1,7 @@
+name: astrbot_plugin_codex_bridge
+display_name: Codex Bridge
+desc: 连接 AstrBot 与本地 Codex 注入桥，支持把 QQ 消息转发到当前活跃 Codex 对话，并接收任务完成或审核提醒。
+version: v0.2.8
+author: OpenAI
+repo: https://github.com/under-the-ocean/astrbot-plugin-codex-bridge
+astrbot_version: ">=4.10.4"
